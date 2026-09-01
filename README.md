@@ -10,9 +10,19 @@ Instead of the stock approach (statically split expert layers between GPU and CP
 compute them directly over PCIe (UVA/DMA), and keeps a small VRAM cache of the experts that
 are actually being routed to — updated continuously at runtime.
 
-> Everything below was measured, not estimated. Hardware: 2× RDNA4 16GB (one PCIe x16, one
-> x4), 62GB DDR4 dual-channel (37.4 GB/s), ROCm. The interesting result is that this works
+> Everything below was measured, not estimated. The interesting result is that this works
 > at all on AMD — every comparable system we found (FreeToken, MoE-Infinity) is CUDA-only.
+
+## Test machine
+
+| component | spec |
+|---|---|
+| CPU | AMD Ryzen 9 5900X (12C/24T) |
+| GPUs | 2× AMD Radeon RDNA4 16 GB (`gfx1200`) — compute card in the CPU x16 slot; second card in a chipset-limited slot (~3.5 GB/s effective, useless as a cache tier — see problem #7) |
+| RAM | 64 GB DDR4 dual-channel — **37.4 GB/s measured**, the number that used to be this box's ceiling |
+| Effective PCIe DMA (host→GPU expert reads) | ~14 GB/s measured |
+| OS / stack | Ubuntu 24.04.4, kernel 7.0, **ROCm 10.0.0** (TheRock `gfx120X` build; HIP backend) |
+| Model storage | NVMe, model file 57 GB, page-cache resident during runs |
 
 ## Results
 
