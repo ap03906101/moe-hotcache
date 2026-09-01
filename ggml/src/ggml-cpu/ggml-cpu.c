@@ -1820,6 +1820,24 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        // [expert-log 2026-09-01] วัด routing locality จริงของโมเดล/งานเรา ก่อนตัดสินใจพอร์ต expert cache
+        // เปิดด้วย GGML_EXPERT_LOG=<ไฟล์> เท่านั้น — ไม่ตั้ง = ไม่มี overhead ใด ๆ
+        {
+            const char * elog_path = getenv("GGML_EXPERT_LOG");
+            if (elog_path) {
+                FILE * elog = fopen(elog_path, "a");
+                if (elog) {
+                    fprintf(elog, "%s n_tok=%d:", src0->name, (int) ids->ne[1]);
+                    for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
+                        for (int id = 0; id < n_ids; ++id) {
+                            fprintf(elog, " %d", *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]));
+                        }
+                    }
+                    fputc('\n', elog);
+                    fclose(elog);
+                }
+            }
+        }
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 

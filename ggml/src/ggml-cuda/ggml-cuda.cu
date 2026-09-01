@@ -5320,6 +5320,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+    // [expert-pin 2026-09-01] โหมด expert pin: ประกาศรองรับ host buffer ตรง ๆ (UVA)
+    // ไม่งั้น scheduler จะสร้างสำเนา weight ทั้ง tensor บน VRAM ทุกรอบ eval
+    // (เปิดเฉพาะเมื่อตั้ง GGML_EXPERT_PIN — พฤติกรรมเดิมไม่เปลี่ยน)
+    static const bool expert_pin_mode = getenv("GGML_EXPERT_PIN") != nullptr ||
+                                        getenv("GGML_EXPERT_PIN_DYN") != nullptr;
+    if (expert_pin_mode && ggml_backend_buft_is_cuda_host(buft)) {
+        return true;
+    }
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
 

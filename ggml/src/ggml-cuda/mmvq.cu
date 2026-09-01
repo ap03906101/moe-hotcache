@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "expert-pin.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -652,8 +653,26 @@ static __global__ void mul_mat_vec_q(
     float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
+    // [expert-pin 2026-09-01] ถ้ามีตารางพอยน์เตอร์ราย expert ให้ใช้ฐานจากตาราง
+    // (ช่องที่ pin ชี้ VRAM ช่องอื่นชี้ host ผ่าน UVA) แล้วตัดพจน์ channel ออกจาก offset
+    const void * vx_eff = vx;
+    [[maybe_unused]] const void * vgate_eff = vgate;
+    uint32_t chx_term_x = channel_x*stride_channel_x;
+    [[maybe_unused]] uint32_t chx_term_g = chx_term_x;
+    if (ids && fusion.x_expert_ptrs) {
+        vx_eff = fusion.x_expert_ptrs[channel_x];
+        chx_term_x = 0;
+    }
+    if constexpr (has_fusion) {
+        if (ids && use_gate && fusion.gate_expert_ptrs) {
+            vgate_eff = fusion.gate_expert_ptrs[channel_x];
+            chx_term_g = 0;
+        }
+    }
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset   = sample_x*stride_sample_x + chx_term_x + row0*stride_row_x;
+    const int kbx_offset_g = sample_x*stride_sample_x + chx_term_g + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -666,11 +685,11 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    vx_eff, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate_eff, &y[j*stride_col_y + kby], kbx_offset_g + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -1310,6 +1329,14 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.gate_scale = fusion->gate_scale->data;
         }
         fusion_local.glu_op = fusion->glu_op;
+    }
+
+    // [expert-pin 2026-09-01] ตารางพอยน์เตอร์ราย expert สำหรับ weight ที่อยู่ host
+    if (ids) {
+        fusion_local.x_expert_ptrs = ggml_cuda_expert_pin_table(src0, ids, stream);
+        if (fusion && fusion->gate) {
+            fusion_local.gate_expert_ptrs = ggml_cuda_expert_pin_table(fusion->gate, ids, stream);
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

@@ -1547,6 +1547,11 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
+    // [expert-pin 2026-09-01] ตารางพอยน์เตอร์ราย expert (device array ขนาด ne02)
+    // non-null เฉพาะเส้น MUL_MAT_ID ที่ weight อยู่ host และเปิด GGML_EXPERT_PIN
+    // ช่องที่ pin ชี้ VRAM · ช่องอื่นชี้ host (UVA) — เคอร์เนลอ่านผ่านตารางแทน base+stride
+    const void * const * x_expert_ptrs = nullptr;
+    const void * const * gate_expert_ptrs = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {
@@ -1674,3 +1679,16 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     CUDA_CHECK(cudaGetLastError());
 }
 
+
+// HIP compat: the CUDA capture-status API is not aliased by the HIP runtime;
+// map it for GGML_CUDA_USE_CUB code paths (argsort/top-k/mean/sum/...).
+#if defined(GGML_USE_HIP) && defined(GGML_CUDA_USE_CUB)
+#ifndef cudaStreamCaptureStatus
+#define cudaStreamCaptureStatus hipStreamCaptureStatus
+#define cudaStreamIsCapturing hipStreamIsCapturing
+#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+#define cudaStreamCaptureStatusActive hipStreamCaptureStatusActive
+#define cudaStreamCaptureStatusGlobal hipStreamCaptureStatusGlobal
+#define cudaStreamCaptureStatusRelaxed hipStreamCaptureStatusRelaxed
+#endif
+#endif

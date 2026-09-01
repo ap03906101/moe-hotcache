@@ -259,6 +259,12 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // [expert-dma 2026-09-01] เปิดให้ -ot ชี้ host (pinned) buffer ได้ เช่น =ROCm_Host
+        // เพื่อทดลองให้ GPU คำนวณ expert ที่ค้างบนแรมผ่าน DMA (ฐานสถาปัตยกรรม expert cache)
+        auto * hbuft = ggml_backend_dev_host_buffer_type(dev);
+        if (hbuft) {
+            buft_list[ggml_backend_buft_name(hbuft)] = hbuft;
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {

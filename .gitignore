@@ -159,3 +159,8 @@ AGENTS.local.md
 # never committed - the Vulkan shared object alone is ~66 MB).
 /build-release/
 /llama-*-bin-ubuntu-vulkan-*.tar.gz
+
+# moe-hotcache: ของเฉพาะเครื่อง ห้ามหลุด
+*-pin.txt
+expert-log*.txt
+*.local.sh
