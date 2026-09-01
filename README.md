@@ -193,14 +193,17 @@ writing every line of code, benchmark, and this README. Full lab notes live in
    direct-DMA only for batch ≤ 8 (the `mmvq` boundary), and force a real VRAM copy for
    larger batches. Lesson, earned twice in one project: **a new GPU data path is not
    measured until its *output* is verified — per quant type, per batch-size regime.**
-10. **(open) The forced VRAM copy path corrupts large-prompt prefill.** After fix #9,
-    batches ≥ 9 take the stock offload path with a forced weight copy — but prompts spanning
-    large/multiple ubatches still produce garbage for that request (decode and small
-    prompts stay correct, so the corruption hides from casual testing). Reproduced
-    deterministically with an ~11k-token prompt. Not yet root-caused: suspects are the
-    `cuda_host → cuda` tensor-copy route and split/copy caching across ubatches. Until
-    fixed, correctness requires routing big batches to CPU threads instead of the copy
-    path.
+10. **(root-caused; perf open as #10b) The forced VRAM copy path corrupted large-prompt
+    prefill.** Prompts spanning large/multiple ubatches produced garbage for that request
+    (decode and small prompts stayed correct, so it hid from casual testing). Root cause,
+    proven with byte-level copy probes: the `supports_buft` claim makes the scheduler
+    assign the host weight to the GPU, so `src_backend == cur_backend` and the entire
+    split-copy block is skipped — the "copy" was never created, and MMQ read the raw host
+    pointer (bug #9's mechanism surviving through the offload door). With the
+    claim-independent force-copy, copies happen and byte-match the host data. The copy
+    route is still ~10× too slow in this mixed setup (sync-serialized same-backend copies
+    + page-cache pressure), so the default routes big batches to CPU threads (correct,
+    moderate speed); `GGML_EXPERT_PIN_PP_CPU=0` opts into the copy route for perf work.
 
 ## Roadmap
 
