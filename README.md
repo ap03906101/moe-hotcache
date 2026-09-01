@@ -39,7 +39,16 @@ history because measure-before-verify is exactly the mistake this README warns a
 | configuration (quality-verified) | decode (tok/s) | prefill (tok/s) | RAM pressure |
 |---|---|---|---|
 | stock llama.cpp, `--n-cpu-moe 33` (tuned baseline) | 11.4 | 163 | none (mmap) |
-| **partial-pin**: 20/48 layers pinned+DMA+dynamic cache, rest CPU/mmap | **13.0–13.4 (+15%)** | 105 cold / **156–276 warm** | none — 30 GB used, zero swap |
+| **partial-pin**: 20/48 layers pinned+DMA+dynamic cache, rest CPU/mmap | **13.0–13.4 (+15%)** | ⚠ see below | none — 30 GB used, zero swap |
+
+**Second correction (later the same night):** the partial-pin *prefill* numbers first
+published here (105/156–276 tok/s) are also **retracted** — the forced-copy offload path
+that produced them corrupts large-prompt output (garbage logits for that request; decode
+unaffected and still verified). Yes, the same class of mistake twice in one day: we
+verified decode output but not prefill output. Decode numbers stand. Until the copy path
+is fixed, prefill on host-pinned layers must route to CPU threads (~66–105 tok/s,
+correct), which loses to the tuned baseline's 163 — so this fork is currently a decode
+win only, and problem #10 is the open front.
 
 Sanity model: OLMoE-1B-7B (64 experts/layer): DMA-only 6.4 → dynamic cache **15–16.8
 (+150%)**, greedy (temp 0) outputs **byte-identical** to the uncached path.
@@ -184,6 +193,14 @@ writing every line of code, benchmark, and this README. Full lab notes live in
    direct-DMA only for batch ≤ 8 (the `mmvq` boundary), and force a real VRAM copy for
    larger batches. Lesson, earned twice in one project: **a new GPU data path is not
    measured until its *output* is verified — per quant type, per batch-size regime.**
+10. **(open) The forced VRAM copy path corrupts large-prompt prefill.** After fix #9,
+    batches ≥ 9 take the stock offload path with a forced weight copy — but prompts spanning
+    large/multiple ubatches still produce garbage for that request (decode and small
+    prompts stay correct, so the corruption hides from casual testing). Reproduced
+    deterministically with an ~11k-token prompt. Not yet root-caused: suspects are the
+    `cuda_host → cuda` tensor-copy route and split/copy caching across ubatches. Until
+    fixed, correctness requires routing big batches to CPU threads instead of the copy
+    path.
 
 ## Roadmap
 
