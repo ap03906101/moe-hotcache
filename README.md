@@ -28,25 +28,25 @@ are actually being routed to — updated continuously at runtime.
 
 Model: Qwen3.8-Flash-Next 131B-A6B (Q3_K_XL, 512 experts/layer, 48 MoE layers, 57 GB file).
 
-| configuration | decode (tok/s) | prefill (tok/s) |
-|---|---|---|
-| stock llama.cpp, `--n-cpu-moe 31` (tuned baseline) | 11.9 | 130–163 |
-| all experts on host, GPU-DMA, **static pin** (4 GB budget, offline profile) | 13.41 (+13%) | 71 |
-| all experts on host, GPU-DMA, **dynamic cache** (4 GB budget, no profile needed) | **19.89 (+67%)** | 4.97 ⚠ |
+**Correction (same day, hours later):** the first published version of this table carried
+131B numbers measured **before verifying output quality**. A batch-kernel bug (problem #9
+below) was silently corrupting the 131B model's output on the DMA path while producing
+plausible speed numbers — those numbers (TG 13.41 / 19.89) are **retracted**. The OLMoE
+numbers were always quality-verified (byte-identical) and stand. The table below is the
+current, quality-verified state; we kept the retraction visible instead of rewriting
+history because measure-before-verify is exactly the mistake this README warns about.
+
+| configuration (quality-verified) | decode (tok/s) | prefill (tok/s) | RAM pressure |
+|---|---|---|---|
+| stock llama.cpp, `--n-cpu-moe 33` (tuned baseline) | 11.4 | 163 | none (mmap) |
+| **partial-pin**: 20/48 layers pinned+DMA+dynamic cache, rest CPU/mmap | **13.0–13.4 (+15%)** | 105 cold / **156–276 warm** | none — 30 GB used, zero swap |
 
 Sanity model: OLMoE-1B-7B (64 experts/layer): DMA-only 6.4 → dynamic cache **15–16.8
 (+150%)**, greedy (temp 0) outputs **byte-identical** to the uncached path.
 
-Two caveats, both understood and both fixable (see roadmap):
-
-1. **Prefill through the DMA path is unusable** (large batches route to nearly every
-   expert, destroying sparsity — a known property of MoE prefill). Fix: route large-batch
-   `mul_mat_id` to CPU (the proven 130–163 path), or port FreeToken-style double-buffered
-   prefill streaming (theoretical ceiling on this box: ~530 tok/s).
-2. **Pinning 55 GB on a 62 GB machine causes swap thrash** (occasional tokens drop to
-   0.8–3 tok/s while the kernel pages other processes). Fix: partial pinning — pin ~20 of
-   48 layers (~24 GB), leave the rest on the CPU path. This is a capacity problem, not a
-   bandwidth problem: in DMA mode the PCIe link (~14 GB/s) is the bottleneck, not RAM speed.
+The all-layers-pinned mode (55 GB pinned on a 62 GB box) still exists but swap-thrashes;
+partial-pin is the daily-driver configuration. Full-pin re-measurement with verified
+quality is pending a machine with more RAM.
 
 ## How it works
 
@@ -172,13 +172,25 @@ writing every line of code, benchmark, and this README. Full lab notes live in
    ubatch. This is a known MoE property (FreeToken's paper treats prefill and decode as
    different problems for exactly this reason) — our measured 71 → 4.97 tok/s prefill is
    that effect plus swap pressure. Prefill needs its own path, full stop.
+9. **The batch kernels don't know about the pointer table — and silently corrupt output.**
+   The costliest bug of the project, found only when we finally asked the 131B model a
+   question and read the answer (`//////…`). The pin table lives in `mmvq` (batch ≤ 8).
+   Prompts of 9–31 tokens fell into a gap: too big for `mmvq`, below our CPU-routing
+   threshold — so they ran `mul_mat_q` (MMQ) reading the host pointer directly. With some
+   quant types that "works" (wrong results, no error); with `Q8_0` it faults. Worse, the
+   `supports_buft` claim meant offloaded big batches also skipped the VRAM copy. On a
+   dynamic-quant GGUF (layers quantized differently) the corruption was *layer-dependent*,
+   which is why a per-layer bisect plus a quant-type dump found it in eight runs. Fixes:
+   direct-DMA only for batch ≤ 8 (the `mmvq` boundary), and force a real VRAM copy for
+   larger batches. Lesson, earned twice in one project: **a new GPU data path is not
+   measured until its *output* is verified — per quant type, per batch-size regime.**
 
 ## Roadmap
 
-- [ ] **Prefill routing**: `supports_op` returns false for large-batch `mul_mat_id` on
-      host weights → scheduler falls back to the CPU path (restores 130–163 tok/s). ~15 lines.
-- [ ] **Partial pinning**: pin ~20/48 layers (~24 GB) to fit real machines; rest stays on
-      the evictable CPU/mmap path. Expected: TG ~14–15, no thrash, stable daily driver.
+- [x] **Prefill routing**: large-batch `mul_mat_id` on host weights takes the stock
+      offload-copy path; only batch ≤ 8 uses the DMA table (see problem #9).
+- [x] **Partial pinning**: 20/48 layers pinned under mmap (loader keeps `-ot` host
+      overrides in expert-pin mode); measured TG 13.0–13.4 / PP 156+ with zero swap.
 - [ ] **Capped-fetch hybrid decode** (FreeToken's q\* policy): let the CPU compute the
       overflow misses in parallel with GPU DMA, bit-exact partial-sum merge.
 - [ ] **Double-buffered prefill streaming**: stream layer N+1's experts while computing

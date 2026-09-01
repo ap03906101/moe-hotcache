@@ -955,6 +955,24 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+                // [expert-pin] MUL_MAT_ID batch ใหญ่ (prefill) บน weight host ที่ GPU ประกาศ
+                // รองรับตรง (DMA): routing แตะ expert เกือบครบ เส้น DMA ต่อ expert แพ้ยับ
+                // (วัด 4.97 vs 130-163) — แกล้งว่าเป็นของ CPU เพื่อให้บล็อก offload ข้างล่าง
+                // ใช้เส้นทาง stock (copy weight ขึ้น GPU ต่อ split แล้วคำนวณจาก VRAM)
+                if (tensor->op == GGML_OP_MUL_MAT_ID && i == 0 &&
+                    src_backend_id != -1 && src_backend_id != sched->n_backends - 1 &&
+                    ggml_backend_buffer_is_host(src->buffer)) {
+                    // ค่าเริ่มต้น 9 = ขอบบนของ mmvq (ncols_dst ≤ 8) — เกินนี้เคอร์เนล batch
+                    // (MMQ/fallback) ไม่รู้จักตาราง pin อ่าน host ตรงแล้วผิด/fault กับบางควอนต์
+                    static const int pp_thresh =
+                        (getenv("GGML_EXPERT_PIN") || getenv("GGML_EXPERT_PIN_DYN"))
+                            ? (getenv("GGML_EXPERT_PIN_PP_BATCH")
+                                   ? atoi(getenv("GGML_EXPERT_PIN_PP_BATCH")) : 9)
+                            : 0;
+                    if (pp_thresh > 0 && tensor->ne[2] >= pp_thresh) {
+                        src_backend_id = sched->n_backends - 1;
+                    }
+                }
                 // check if a backend with higher prio wants to offload the op
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
@@ -1396,7 +1414,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                // [expert-pin] weight host ที่ถูกใช้โดย MUL_MAT_ID batch ใหญ่บน GPU ต้องได้
+                // สำเนา VRAM จริง — supports_buft hack ทำให้ buffer_supported ตอบ "ใช้ได้"
+                // แล้วเคอร์เนล batch (MMQ) ไปอ่าน host ตรง ซึ่งผิด/fault กับบางควอนต์
+                bool expert_pin_force_copy = false;
+                if (node->op == GGML_OP_MUL_MAT_ID && j == 0 && src->buffer != NULL &&
+                    src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(src->buffer) &&
+                    cur_backend_id != sched->n_backends - 1 &&
+                    (getenv("GGML_EXPERT_PIN") || getenv("GGML_EXPERT_PIN_DYN"))) {
+                    static const int pp_thresh = getenv("GGML_EXPERT_PIN_PP_BATCH")
+                        ? atoi(getenv("GGML_EXPERT_PIN_PP_BATCH")) : 9;
+                    expert_pin_force_copy = pp_thresh > 0 && node->ne[2] >= pp_thresh;
+                }
+                if (src_backend_id != cur_backend_id &&
+                    (expert_pin_force_copy || !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id))) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
