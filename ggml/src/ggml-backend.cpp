@@ -956,21 +956,27 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // [expert-pin] MUL_MAT_ID batch ใหญ่ (prefill) บน weight host ที่ GPU ประกาศ
-                // รองรับตรง (DMA): routing แตะ expert เกือบครบ เส้น DMA ต่อ expert แพ้ยับ
-                // (วัด 4.97 vs 130-163) — แกล้งว่าเป็นของ CPU เพื่อให้บล็อก offload ข้างล่าง
-                // ใช้เส้นทาง stock (copy weight ขึ้น GPU ต่อ split แล้วคำนวณจาก VRAM)
+                // รองรับตรง (DMA): routing แตะ expert เกือบครบ เคอร์เนล batch ไม่รู้จักตาราง pin
+                // และเส้น forced-copy ก็ยังผลิตผลผิดกับ prompt หลาย ubatch (บั๊ก #10 ใน README)
+                // — ส่งลง CPU threads ตรง ๆ (อ่าน pinned host ได้ ถูกต้องพิสูจน์แล้ว ~66-105 tok/s)
+                // ค่าเริ่มต้น 9 = ขอบบนของ mmvq (ncols_dst ≤ 8)
                 if (tensor->op == GGML_OP_MUL_MAT_ID && i == 0 &&
                     src_backend_id != -1 && src_backend_id != sched->n_backends - 1 &&
                     ggml_backend_buffer_is_host(src->buffer)) {
-                    // ค่าเริ่มต้น 9 = ขอบบนของ mmvq (ncols_dst ≤ 8) — เกินนี้เคอร์เนล batch
-                    // (MMQ/fallback) ไม่รู้จักตาราง pin อ่าน host ตรงแล้วผิด/fault กับบางควอนต์
                     static const int pp_thresh =
                         (getenv("GGML_EXPERT_PIN") || getenv("GGML_EXPERT_PIN_DYN"))
                             ? (getenv("GGML_EXPERT_PIN_PP_BATCH")
                                    ? atoi(getenv("GGML_EXPERT_PIN_PP_BATCH")) : 9)
                             : 0;
                     if (pp_thresh > 0 && tensor->ne[2] >= pp_thresh) {
-                        src_backend_id = sched->n_backends - 1;
+                        // GGML_EXPERT_PIN_PP_CPU=0 = โหมดดีบัก: เดินเส้น offload+copy (บั๊ก #10)
+                        static const bool pp_cpu = !(getenv("GGML_EXPERT_PIN_PP_CPU") &&
+                                                     atoi(getenv("GGML_EXPERT_PIN_PP_CPU")) == 0);
+                        if (pp_cpu) {
+                            SET_CAUSE(tensor, "1.pin-cpu");
+                            return sched->n_backends - 1;
+                        }
+                        src_backend_id = sched->n_backends - 1; // ตกไปให้บล็อก offload ข้างล่าง
                     }
                 }
                 // check if a backend with higher prio wants to offload the op
@@ -1344,6 +1350,20 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             need_new_split = true;
                             break;
                         }
+                        // [expert-pin] weight host ที่จะโดน force copy (บั๊ก #10) ต้องได้ split
+                        // ของตัวเอง — ให้ nodes[0] เป็น MUL_MAT_ID แล้วเข้าเส้น copy เฉพาะ
+                        // expert ที่ใช้ (async slices) แทน full copy แบบ sync ที่ช้า 10 เท่า
+                        if (node->op == GGML_OP_MUL_MAT_ID && j == 0 &&
+                            ggml_backend_buffer_is_host(src->buffer) &&
+                            cur_backend_id != sched->n_backends - 1 &&
+                            (getenv("GGML_EXPERT_PIN") || getenv("GGML_EXPERT_PIN_DYN"))) {
+                            static const int pp_thresh = getenv("GGML_EXPERT_PIN_PP_BATCH")
+                                ? atoi(getenv("GGML_EXPERT_PIN_PP_BATCH")) : 9;
+                            if (pp_thresh > 0 && node->ne[2] >= pp_thresh) {
+                                need_new_split = true;
+                                break;
+                            }
+                        }
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
@@ -1427,8 +1447,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         ? atoi(getenv("GGML_EXPERT_PIN_PP_BATCH")) : 9;
                     expert_pin_force_copy = pp_thresh > 0 && node->ne[2] >= pp_thresh;
                 }
-                if (src_backend_id != cur_backend_id &&
-                    (expert_pin_force_copy || !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id))) {
+                // force_copy ต้องไม่ติดเงื่อนไข src!=cur — supports_buft hack ทำให้ weight
+                // cuda_host ถูกนับว่า "อยู่บน GPU แล้ว" (src==cur) แล้วข้ามบล็อกนี้ทั้งก้อน
+                // → MMQ อ่าน host ตรง = ที่มาของบั๊ก #10
+                if (expert_pin_force_copy ||
+                    (src_backend_id != cur_backend_id &&
+                     !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id))) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1755,6 +1779,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+                    // [expert-pin dbg] ตรวจว่าสำเนา expert แรกที่ใช้ ตรงกับ host จริง
+                    if (getenv("GGML_EXPERT_PIN_DEBUG_COPY")) {
+                        static int dbg_n = 0;
+                        if (dbg_n++ < 24) {
+                            ggml_backend_synchronize(split_backend);
+                            char buf[512];
+                            ggml_backend_tensor_get(input_cpy, buf, (size_t) first_id * expert_size, sizeof(buf));
+                            int same = memcmp(buf, (const char *) input->data + (size_t) first_id * expert_size, sizeof(buf)) == 0;
+                            fprintf(stderr, "[copy dbg] %s slice e%d..%d: %s\n", input->name,
+                                    first_id, last_id, same ? "MATCH" : "MISMATCH!");
+                        }
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -1766,6 +1802,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_backend_synchronize(split_backend);
                         }
                         ggml_backend_tensor_copy(input, input_cpy);
+                    }
+                    // [expert-pin dbg] ตรวจสำเนาเต็มก้อนของ weight host
+                    if (getenv("GGML_EXPERT_PIN_DEBUG_COPY") &&
+                        input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
+                        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                        static int dbg_full = 0;
+                        if (dbg_full++ < 24) {
+                            ggml_backend_synchronize(split_backend);
+                            char buf[512];
+                            ggml_backend_tensor_get(input_cpy, buf, 0, sizeof(buf));
+                            int same = memcmp(buf, input->data, sizeof(buf)) == 0;
+                            fprintf(stderr, "[copy dbg] %s FULL: %s\n", input->name,
+                                    same ? "MATCH" : "MISMATCH!");
+                        }
                     }
                 }
             }
