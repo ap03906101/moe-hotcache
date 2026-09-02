@@ -200,10 +200,23 @@ writing every line of code, benchmark, and this README. Full lab notes live in
     assign the host weight to the GPU, so `src_backend == cur_backend` and the entire
     split-copy block is skipped — the "copy" was never created, and MMQ read the raw host
     pointer (bug #9's mechanism surviving through the offload door). With the
-    claim-independent force-copy, copies happen and byte-match the host data. The copy
-    route is still ~10× too slow in this mixed setup (sync-serialized same-backend copies
-    + page-cache pressure), so the default routes big batches to CPU threads (correct,
-    moderate speed); `GGML_EXPERT_PIN_PP_CPU=0` opts into the copy route for perf work.
+    claim-independent force-copy, copies happen and byte-match the host data.
+
+    **#10b closed as understood (not a code bug):** the remaining prefill slowness on the
+    test box is a **host-RAM capacity wall**, measured directly: prefill touches every
+    expert of every host layer per ubatch (~45 GB of file pages), but with 12 GB pinned
+    the page cache can only hold ~33 GB (51% of the model file, `cacheprobe` verified) —
+    so each ubatch re-reads ~12 GB from NVMe, and both the copy route and the CPU route
+    degrade to disk speed (measured 17 → 2.6 tok/s as cache pressure builds). The stock
+    `--n-cpu-moe` baseline escapes this only because it parks ~15 expert layers in VRAM,
+    shrinking the host-resident set to ~40 GB, which fits. Corollary: **on a 64 GB box
+    this fork is a decode-side win** (TG +15%, verified) with prefill best left to the
+    stock config; **with enough RAM headroom (e.g. 128 GB) the whole design runs at full
+    speed on both paths** — pinned set + full file cache coexist. One real bug remains
+    noted: the background refresh thread can stall a long prefill (park it via
+    `GGML_EXPERT_PIN_REFRESH_MS` during batch-heavy phases; auto-pause is a TODO).
+    Debug env: `GGML_EXPERT_PIN_PP_CPU=0` opts into the copy route,
+    `GGML_EXPERT_PIN_DEBUG_COPY=1` prints byte-check probes.
 
 ## Roadmap
 

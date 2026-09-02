@@ -1706,7 +1706,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
 
-                    ggml_backend_synchronize(input_backend);
+                    // [expert-pin] weight ไม่มี producer — sync ต้นทางไม่จำเป็น และแพงมาก
+                    // เมื่อ input ถูกนับเป็นของ GPU (cuda_host ใต้ supports_buft hack):
+                    // sync GPU เต็มตัวต่อ input ×หลักหลายสิบต่อ ubatch = ที่มาของ PP ช้า 10 เท่า
+                    if (!(input->buffer &&
+                          ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                          ggml_backend_buffer_is_host(input->buffer))) {
+                        ggml_backend_synchronize(input_backend);
+                    }
 
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
@@ -1791,6 +1798,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     first_id, last_id, same ? "MATCH" : "MISMATCH!");
                         }
                     }
+                } else if (input->buffer &&
+                           ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                           ggml_backend_buffer_is_host(input->buffer)) {
+                    // [expert-pin] weight บน host: อ่านผ่านพอยน์เตอร์ host ตรง ๆ แบบ async
+                    // บน split backend — ไม่ต้อง sync ต้นทาง (weight ไม่มี producer)
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
